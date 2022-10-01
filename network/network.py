@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from .components import ResidualBlock, AdaptiveResidualBlock, ResidualBlockDown, AdaptiveResidualBlockUp, SelfAttention
+from .components import ResidualBlock, ResidualBlockUp, ResidualBlockDown, AdaptiveResidualBlockUp, SelfAttention
 import config
 
 
@@ -22,6 +22,77 @@ def weights_init(m):
         m.bias.data.fill_(0)
 
 
+class MotionEncoder(nn.Module):
+    """
+    Motion Encoder network extracts features related to overall motions of a head.
+    Features are decomposed into static ones and dynamic ones.
+    """
+    def __init__(self, gpu=None):
+        super(MotionEncoder, self).__init__()
+
+        # encoding layers
+        self.conv1 = ResidualBlockDown(3, 128)
+        self.in1_e = nn.InstanceNorm2d(128, affine=True)
+
+        self.conv2 = ResidualBlockDown(128, 256)
+        self.in2_e = nn.InstanceNorm2d(256, affine=True)
+
+        self.conv3 = ResidualBlockDown(256, 512)
+        self.in3_e = nn.InstanceNorm2d(512, affine=True)
+
+        self.conv4 = ResidualBlockDown(512, 512)
+        self.in4_e = nn.InstanceNorm2d(512, affine=True)
+
+        self.pooling = nn.AdaptiveMaxPool2d((1, 1))
+
+        self.gru = nn.GRU(512, 512, batch_first=True)
+        self.fc = nn.Linear(512, 128)
+
+    def forward(self, x):
+        B, K, C, H, W = x.shape
+        x = x.view(-1, C, H, W)
+
+        # Encode
+        out = self.conv1(x)
+        out = self.in1_e(x)
+        out = self.conv2(x)
+        out = self.in2_e(x)
+        out = self.conv3(x)
+        out = self.in3_e(x)
+        out = self.conv4(x)
+        out = self.in4_e(x)
+        out = F.relu(self.pooling(out))
+
+        x = x.view(B, K, -1)
+        early = self.fc(x)
+        static = self.gru(out)
+        return static, early
+
+
+class DynamicAdder(nn.Module):
+    """
+    Dynamic Adder network receives a 'dynamic' vector from Motion Encoder and upsamples it.
+    """
+    def __init__(self, gpu=None):
+        super(DynamicAdder, self).__init__(self)
+
+        # Decoder
+        self.fc = nn.Linear(1, 16)
+
+        self.deconv2 = ResidualBlockUp(128, 128, upsample=4)
+        self.in2_d = nn.InstanceNorm2d(128, affine=True)
+
+        self.deconv1 = ResidualBlockUp(128, 128, upsample=4)
+        self.in1_d = nn.InstanceNorm2d(128, affine=True)
+
+    def forward(self, x):
+        B, _ = x.shape
+        out = self.fc(x.unsqueeze(2)).view(B, 4, 4)
+        out = self.in2_d(self.deconv2(out))
+        out = self.in1_d(self.deconv1(out))
+        return out
+
+
 class Embedder(nn.Module):
     """
     The Embedder network attempts to generate a vector that encodes the personal characteristics of an individual given
@@ -30,7 +101,7 @@ class Embedder(nn.Module):
     def __init__(self, gpu=None):
         super(Embedder, self).__init__()
 
-        self.conv1 = ResidualBlockDown(6, 64)
+        self.conv1 = ResidualBlockDown(3, 64)
         self.conv2 = ResidualBlockDown(64, 128)
         self.conv3 = ResidualBlockDown(128, 256)
         self.att = SelfAttention(256)
@@ -45,18 +116,13 @@ class Embedder(nn.Module):
         if gpu is not None:
             self.cuda(gpu)
 
-    def forward(self, x, y):
+    def forward(self, x):
         assert x.dim() == 4 and x.shape[1] == 3, "Both x and y must be tensors with shape [BxK, 3, W, H]."
-        assert x.shape == y.shape, "Both x and y must be tensors with shape [BxK, 3, W, H]."
         if self.gpu is not None:
             x = x.cuda(self.gpu)
-            y = y.cuda(self.gpu)
-
-        # Concatenate x & y
-        out = torch.cat((x, y), dim=1)  # [BxK, 6, 256, 256]
 
         # Encode
-        out = (self.conv1(out))  # [BxK, 64, 128, 128]
+        out = (self.conv1(x))  # [BxK, 64, 128, 128]
         out = (self.conv2(out))  # [BxK, 128, 64, 64]
         out = (self.conv3(out))  # [BxK, 256, 32, 32]
         out = self.att(out)
@@ -72,11 +138,6 @@ class Embedder(nn.Module):
 
 class Generator(nn.Module):
     ADAIN_LAYERS = OrderedDict([
-        ('res1', (512, 512)),
-        ('res2', (512, 512)),
-        ('res3', (512, 512)),
-        ('res4', (512, 512)),
-        ('res5', (512, 512)),
         ('deconv6', (512, 512)),
         ('deconv5', (512, 512)),
         ('deconv4', (512, 256)),
@@ -91,36 +152,11 @@ class Generator(nn.Module):
         # projection layer
         self.PSI_PORTIONS, self.psi_length = self.define_psi_slices()
         self.projection = nn.Parameter(torch.rand(self.psi_length, config.E_VECTOR_LENGTH).normal_(0.0, 0.02))
-
-        # encoding layers
-        self.conv1 = ResidualBlockDown(3, 64)
-        self.in1_e = nn.InstanceNorm2d(64, affine=True)
-
-        self.conv2 = ResidualBlockDown(64, 128)
-        self.in2_e = nn.InstanceNorm2d(128, affine=True)
-
-        self.conv3 = ResidualBlockDown(128, 256)
-        self.in3_e = nn.InstanceNorm2d(256, affine=True)
-
-        self.att1 = SelfAttention(256)
-
-        self.conv4 = ResidualBlockDown(256, 512)
-        self.in4_e = nn.InstanceNorm2d(512, affine=True)
-
-        self.conv5 = ResidualBlockDown(512, 512)
-        self.in5_e = nn.InstanceNorm2d(512, affine=True)
-
-        self.conv6 = ResidualBlockDown(512, 512)
-        self.in6_e = nn.InstanceNorm2d(512, affine=True)
-
-        # residual layers
-        self.res1 = AdaptiveResidualBlock(512)
-        self.res2 = AdaptiveResidualBlock(512)
-        self.res3 = AdaptiveResidualBlock(512)
-        self.res4 = AdaptiveResidualBlock(512)
-        self.res5 = AdaptiveResidualBlock(512)
+        self.static_fc = nn.Parameter(512, 512)
 
         # decoding layers
+        self.fc = nn.Linear(1, 16)
+
         self.deconv6 = AdaptiveResidualBlockUp(512, 512, upsample=2)
         self.in6_d = nn.InstanceNorm2d(512, affine=True)
 
@@ -146,39 +182,29 @@ class Generator(nn.Module):
         if gpu is not None:
             self.cuda(gpu)
 
-    def forward(self, y, e):
+    def forward(self, y, e, s=None, d=None):
         if self.gpu is not None:
             e = e.cuda(self.gpu)
             y = y.cuda(self.gpu)
 
-        out = y  # [B, 3, 256, 256]
+        B, _, H, W = y.shape
+        out = y  # [B, 512]
+        if s is not None:
+            y += self.static_fc(s)
 
         # Calculate psi_hat parameters
         P = self.projection.unsqueeze(0)
         P = P.expand(e.shape[0], P.shape[1], P.shape[2])
         psi_hat = torch.bmm(P, e.unsqueeze(2)).squeeze(2)
 
-        # Encode
-        out = self.in1_e(self.conv1(out))  # [B, 64, 128, 128]
-        out = self.in2_e(self.conv2(out))  # [B, 128, 64, 64]
-        out = self.in3_e(self.conv3(out))  # [B, 256, 32, 32]
-        out = self.att1(out)
-        out = self.in4_e(self.conv4(out))  # [B, 512, 16, 16]
-        out = self.in5_e(self.conv5(out))  # [B, 512, 8, 8]
-        out = self.in6_e(self.conv6(out))  # [B, 512, 4, 4]
-
-        # Residual layers
-        out = self.res1(out, *self.slice_psi(psi_hat, 'res1'))
-        out = self.res2(out, *self.slice_psi(psi_hat, 'res2'))
-        out = self.res3(out, *self.slice_psi(psi_hat, 'res3'))
-        out = self.res4(out, *self.slice_psi(psi_hat, 'res4'))
-        out = self.res5(out, *self.slice_psi(psi_hat, 'res5'))
-
         # Decode
+        out = self.fc(out.unsqueeze(2)).view(B, -1, 4, 4)
         out = self.in6_d(self.deconv6(out, *self.slice_psi(psi_hat, 'deconv6')))  # [B, 512, 4, 4]
         out = self.in5_d(self.deconv5(out, *self.slice_psi(psi_hat, 'deconv5')))  # [B, 512, 16, 16]
         out = self.in4_d(self.deconv4(out, *self.slice_psi(psi_hat, 'deconv4')))  # [B, 256, 32, 32]
         out = self.in3_d(self.deconv3(out, *self.slice_psi(psi_hat, 'deconv3')))  # [B, 128, 64, 64]
+        if d is not None:
+            out += d
         out = self.att2(out)
         out = self.in2_d(self.deconv2(out, *self.slice_psi(psi_hat, 'deconv2')))  # [B, 64, 128, 128]
         out = self.in1_d(self.deconv1(out, *self.slice_psi(psi_hat, 'deconv1')))  # [B, 3, 256, 256]

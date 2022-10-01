@@ -51,6 +51,8 @@ def meta_train(gpu, dataset_path, continue_id):
 
     # region NETWORK ---------------------------------------------------------------------------------------------------
 
+    M = network.MotionEncoder(GPU['MotionEncoder'])
+    Y = network.DynamicAdder(GPU['DynamicAdder'])
     E = network.Embedder(GPU['Embedder'])
     G = network.Generator(GPU['Generator'])
     D = network.Discriminator(len(raw_dataset), GPU['Discriminator'])
@@ -91,42 +93,70 @@ def meta_train(gpu, dataset_path, continue_id):
             # video [B, K+1, 2, C, W, H]
 
             # Put one frame aside (frame t)
-            t = video[:, -1, ...]  # [B, 2, C, W, H]
-            video = video[:, :-1, ...]  # [B, K, 2, C, W, H]
-            dims = video.shape
+            t = video[:, -2:, ...]  # [B, 2, C, W, H]
+            video = video[:, :-2, ...]  # [B, K, 2, C, W, H]
+            dims = t.shape
 
             # Calculate average encoding vector for video
-            e_in = video.reshape(dims[0] * dims[1], dims[2], dims[3], dims[4], dims[5])  # [BxK, 2, C, W, H]
+            e_in = t.reshape(dims[0] * dims[1], dims[2], dims[3], dims[4], dims[5])  # [BxK, 2, C, W, H]
             x, y = e_in[:, 0, ...], e_in[:, 1, ...]
             e_vectors = E(x).reshape(dims[0], dims[1], -1)  # B, K, len(e)
             e_hat = e_vectors.mean(dim=1)
 
             # Generate frame using landmarks from frame t
-            x_t, y_t = t[:, 0, ...], t[:, 1, ...]
-            x_hat = G(e_hat, e_hat)
+            x_t, y_t = video[:, :, 0, ...], video[:, :, 1, ...]
+            static, dynamic = M(x_t)
+
+            loss_static = 0
+            loss_dynamic = 0
+            m = 1
+            window_size = 10
+            for l in range(static.shape[1]):
+                tmp = torch.mean(torch.square(static[:, l].unsqueeze(1) - static), dim=1)
+                mask = torch.zeros_like(loss_static)
+                idx_min = max(0, l - window_size)
+                idx_max = min(static.shape[1] - 1, l + window_size)
+                mask[:, idx_min:idx_max, ...] = 1
+                loss_static += mask * tmp
+                loss_dynamic += torch.mean(torch.square(
+                    torch.maximum(0, m - torch.square(dynamic[:, l].unsqueeze(1) - dynamic))), dim=1)
+
+            dynamic = Y(dynamic)
+            out = []
+            for index in range(static.shape[1]):
+                x_hat = G(e_hat, e_hat, s=static[:, index], d=dynamic[:, index])
+                out.append(x_hat)
 
             # Optimize E_G and D
-            r_x_hat, _ = D(x_hat, y_t, i)
-            r_x, _ = D(x_t, y_t, i)
-
             optimizer_E_G.zero_grad()
             optimizer_D.zero_grad()
+            loss_E_G = 0
+            loss_D = 0
 
-            loss_E_G = criterion_E_G(x_t, x_hat, r_x_hat, e_hat, D.W[:, i].transpose(1, 0))
-            loss_D = criterion_D(r_x, r_x_hat)
-            loss = loss_E_G + loss_D
+            for x_hat in out:
+                r_x_hat, _ = D(x_hat, y_t, i)
+                r_x, _ = D(x_t, y_t, i)
+
+                loss_E_G += criterion_E_G(x_t, x_hat, r_x_hat, e_hat, D.W[:, i].transpose(1, 0))
+                loss_D += criterion_D(r_x, r_x_hat)
+
+            lamda = 0.3
+            loss = (loss_E_G + loss_D) / static.shape[1] + lamda * (loss_static + loss_dynamic)
             loss.backward()
 
             optimizer_E_G.step()
             optimizer_D.step()
 
             # Optimize D again
-            x_hat = G(y_t, e_hat).detach()
-            r_x_hat, D_act_hat = D(x_hat, y_t, i)
-            r_x, D_act = D(x_t, y_t, i)
-
             optimizer_D.zero_grad()
-            loss_D = criterion_D(r_x, r_x_hat)
+            loss_D = 0
+            for index in range(static.shape[1]):
+                x_hat = G(e_hat, e_hat, s=static[:, index], d=dynamic[:, index]).detach()
+                r_x_hat, D_act_hat = D(x_hat, y_t, i)
+                r_x, D_act = D(x_t, y_t, i)
+
+                loss_D += criterion_D(r_x, r_x_hat)
+
             loss_D.backward()
             optimizer_D.step()
 
